@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"slices"
 
 	"strings"
 	"time"
@@ -34,6 +35,72 @@ func getIPFromAddrs(addrs []net.Addr) string {
 // Standalone callers without POD_IP fall back to the host default IP discovery.
 func GetIPToHost() (string, error) {
 	return getIPToHost(os.Getenv(lhnet.EnvPodIP), getHostDefaultIP)
+}
+
+// GetIPToHostByFamily selects a V1 frontend address on the interface holding
+// POD_IP, never the Multus storage interface. Unspecified returns GetIPToHost's
+// exact primary address or host default IP for standalone callers. Explicit
+// families require POD_IP and fail rather than selecting an address on another
+// interface.
+func GetIPToHostByFamily(family lhnet.IPFamily) (string, error) {
+	if family == lhnet.IPFamilyUnspecified {
+		return GetIPToHost()
+	}
+	return getIPToHostByFamily(family, os.Getenv(lhnet.EnvPodIP), net.Interfaces,
+		func(iface net.Interface) ([]net.Addr, error) { return iface.Addrs() })
+}
+
+func getIPToHostByFamily(family lhnet.IPFamily, podIP string, interfaces func() ([]net.Interface, error),
+	interfaceAddrs func(net.Interface) ([]net.Addr, error)) (string, error) {
+	if family != lhnet.IPFamilyIPv4 && family != lhnet.IPFamilyIPv6 {
+		return "", fmt.Errorf("invalid explicit IP family %q", family)
+	}
+	if podIP == "" {
+		return "", fmt.Errorf("cannot select %s address without POD_IP", family)
+	}
+	parsedPodIP := net.ParseIP(podIP)
+	if !lhnet.IsUsableIPForFamily(parsedPodIP, lhnet.IPFamilyUnspecified) {
+		return "", fmt.Errorf("invalid POD_IP %q", podIP)
+	}
+
+	ifaces, err := interfaces()
+	if err != nil {
+		return "", err
+	}
+	for _, iface := range ifaces {
+		if iface.Name == lhnet.StorageNetworkInterface {
+			continue
+		}
+		addrs, err := interfaceAddrs(iface)
+		if err != nil {
+			return "", errors.Wrapf(err, "cannot get addresses for interface %s", iface.Name)
+		}
+		if !slices.ContainsFunc(addrs, func(addr net.Addr) bool { return parsedPodIP.Equal(getInterfaceIP(addr)) }) {
+			continue
+		}
+		if lhnet.IsUsableIPForFamily(parsedPodIP, family) {
+			// Keep the portal canonical, as getIPToHost does.
+			return parsedPodIP.String(), nil
+		}
+		for _, addr := range addrs {
+			if ip := getInterfaceIP(addr); lhnet.IsUsableIPForFamily(ip, family) {
+				return ip.String(), nil
+			}
+		}
+		return "", fmt.Errorf("no usable %s address on POD_IP interface %s (%s)", family, iface.Name, podIP)
+	}
+	return "", fmt.Errorf("cannot find pod-network interface holding POD_IP %q", podIP)
+}
+
+func getInterfaceIP(addr net.Addr) net.IP {
+	switch addr := addr.(type) {
+	case *net.IPNet:
+		return addr.IP
+	case *net.IPAddr:
+		return addr.IP
+	default:
+		return nil
+	}
 }
 
 func getIPToHost(podIP string, getDefaultIP func() (string, error)) (string, error) {

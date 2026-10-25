@@ -8,6 +8,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/sirupsen/logrus"
 
+	lhnet "github.com/longhorn/go-common-libs/net"
 	lhns "github.com/longhorn/go-common-libs/ns"
 	lhtypes "github.com/longhorn/go-common-libs/types"
 
@@ -35,6 +36,12 @@ type IscsiDeviceParameters struct {
 	IscsiAbortTimeout int64
 }
 
+// DeviceOptions configures new iSCSI attachments. The zero value preserves
+// unspecified-family selection; existing sessions keep their portal.
+type DeviceOptions struct {
+	IPFamily lhnet.IPFamily
+}
+
 type Device struct {
 	Target       string
 	KernelDevice *lhtypes.BlockDeviceInfo
@@ -46,18 +53,29 @@ type Device struct {
 	BSType      string
 	BSOpts      string
 
+	options DeviceOptions
+
 	targetID int
 
 	nsexec *lhns.Executor
 }
 
 func NewDevice(name, backingFile, bsType, bsOpts string, scsiTimeout, iscsiAbortTimeout int64) (*Device, error) {
+	return NewDeviceWithOptions(name, backingFile, bsType, bsOpts, scsiTimeout, iscsiAbortTimeout, DeviceOptions{})
+}
+
+// NewDeviceWithOptions creates a device with an explicit attachment policy.
+func NewDeviceWithOptions(name, backingFile, bsType, bsOpts string, scsiTimeout, iscsiAbortTimeout int64, options DeviceOptions) (*Device, error) {
 	namespaces := []lhtypes.Namespace{lhtypes.NamespaceMnt, lhtypes.NamespaceNet}
 	nsexec, err := lhns.NewNamespaceExecutor(util.ISCSIdProcess, lhtypes.HostProcDirectory, namespaces)
 	if err != nil {
 		return nil, err
 	}
 
+	return newDevice(name, backingFile, bsType, bsOpts, scsiTimeout, iscsiAbortTimeout, options, nsexec), nil
+}
+
+func newDevice(name, backingFile, bsType, bsOpts string, scsiTimeout, iscsiAbortTimeout int64, options DeviceOptions, nsexec *lhns.Executor) *Device {
 	dev := &Device{
 		Target: GetTargetName(name),
 		ScsiDeviceParameters: ScsiDeviceParameters{
@@ -70,8 +88,9 @@ func NewDevice(name, backingFile, bsType, bsOpts string, scsiTimeout, iscsiAbort
 		BSType:      bsType,
 		BSOpts:      bsOpts,
 		nsexec:      nsexec,
+		options:     options,
 	}
-	return dev, nil
+	return dev
 }
 
 func Volume2ISCSIName(name string) string {
@@ -149,7 +168,7 @@ func (dev *Device) StartInitator() error {
 		return err
 	}
 
-	localIP, err := util.GetIPToHost()
+	localIP, err := util.GetIPToHostByFamily(dev.options.IPFamily)
 	if err != nil {
 		return err
 	}
@@ -170,7 +189,7 @@ func (dev *Device) startInitiatorNoLock() error {
 		return err
 	}
 
-	localIP, err := util.GetIPToHost()
+	localIP, err := util.GetIPToHostByFamily(dev.options.IPFamily)
 	if err != nil {
 		return err
 	}
@@ -279,9 +298,15 @@ func (dev *Device) RefreshInitiator() error {
 // getInitiatorIP preserves the portal of an attached volume on reload/rescan.
 // When the session portal cannot be determined, warn and use the pod IP.
 func (dev *Device) getInitiatorIP() (string, error) {
-	return getInitiatorIP(dev.Target, func(target string) (string, error) {
+	return dev.initiatorIPWithSelectors(func(target string) (string, error) {
 		return iscsi.GetTargetSessionIP(target, dev.nsexec)
-	}, util.GetIPToHost)
+	}, util.GetIPToHostByFamily)
+}
+
+func (dev *Device) initiatorIPWithSelectors(sessionIP func(string) (string, error), newIP func(lhnet.IPFamily) (string, error)) (string, error) {
+	return getInitiatorIP(dev.Target, sessionIP, func() (string, error) {
+		return newIP(dev.options.IPFamily)
+	})
 }
 
 func getInitiatorIP(target string, sessionIP func(string) (string, error), newAttachmentPortalIP func() (string, error)) (string, error) {

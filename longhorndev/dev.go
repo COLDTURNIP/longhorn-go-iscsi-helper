@@ -11,6 +11,8 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/sirupsen/logrus"
 
+	lhnet "github.com/longhorn/go-common-libs/net"
+
 	"github.com/longhorn/go-iscsi-helper/iscsidev"
 	"github.com/longhorn/go-iscsi-helper/types"
 	"github.com/longhorn/go-iscsi-helper/util"
@@ -24,6 +26,11 @@ const (
 	WaitCount    = 30
 )
 
+// DeviceOptions configures the IP family for new iSCSI attachments.
+type DeviceOptions struct {
+	IPFamily lhnet.IPFamily
+}
+
 type LonghornDevice struct {
 	*sync.RWMutex
 	name                      string //VolumeName
@@ -33,6 +40,7 @@ type LonghornDevice struct {
 	scsiTimeout               int64
 	iscsiAbortTimeout         int64
 	iscsiTargetRequestTimeout int64
+	options                   DeviceOptions
 
 	scsiDevice *iscsidev.Device
 	// deviceReady is set only after iSCSI discovery and createDev() both
@@ -64,6 +72,12 @@ type DeviceCreator interface {
 type LonghornDeviceCreator struct{}
 
 func (ldc *LonghornDeviceCreator) NewDevice(name string, size int64, frontend string, scsiTimeout, iscsiAbortTimeout, iscsiTargetRequestTimeout int64) (DeviceService, error) {
+	return ldc.NewDeviceWithOptions(name, size, frontend, scsiTimeout, iscsiAbortTimeout, iscsiTargetRequestTimeout, DeviceOptions{})
+}
+
+// NewDeviceWithOptions preserves NewDevice's defaults while allowing explicit
+// IP-family selection. DeviceCreator and existing callers remain unchanged.
+func (ldc *LonghornDeviceCreator) NewDeviceWithOptions(name string, size int64, frontend string, scsiTimeout, iscsiAbortTimeout, iscsiTargetRequestTimeout int64, options DeviceOptions) (DeviceService, error) {
 	if name == "" || size == 0 {
 		return nil, fmt.Errorf("invalid parameter for creating Longhorn device")
 	}
@@ -74,6 +88,7 @@ func (ldc *LonghornDeviceCreator) NewDevice(name string, size int64, frontend st
 		scsiTimeout:               scsiTimeout,
 		iscsiAbortTimeout:         iscsiAbortTimeout,
 		iscsiTargetRequestTimeout: iscsiTargetRequestTimeout,
+		options:                   options,
 	}
 	if err := dev.SetFrontend(frontend); err != nil {
 		return nil, err
@@ -97,10 +112,14 @@ func (d *LonghornDevice) InitDevice() error {
 	return d.shutdownFrontend()
 }
 
+func (d *LonghornDevice) iscsiDeviceOptions() iscsidev.DeviceOptions {
+	return iscsidev.DeviceOptions{IPFamily: d.options.IPFamily}
+}
+
 // call with lock hold
 func (d *LonghornDevice) initScsiDevice() error {
 	bsOpts := fmt.Sprintf("size=%v;request_timeout=%v", d.size, d.iscsiTargetRequestTimeout)
-	scsiDev, err := iscsidev.NewDevice(d.name, d.GetSocketPath(), "longhorn", bsOpts, d.scsiTimeout, d.iscsiAbortTimeout)
+	scsiDev, err := iscsidev.NewDeviceWithOptions(d.name, d.GetSocketPath(), "longhorn", bsOpts, d.scsiTimeout, d.iscsiAbortTimeout, d.iscsiDeviceOptions())
 	if err != nil {
 		return err
 	}
