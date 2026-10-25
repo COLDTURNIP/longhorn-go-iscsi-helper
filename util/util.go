@@ -12,6 +12,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 
+	lhnet "github.com/longhorn/go-common-libs/net"
 	lhtypes "github.com/longhorn/go-common-libs/types"
 )
 
@@ -24,7 +25,29 @@ func getIPFromAddrs(addrs []net.Addr) string {
 	return ""
 }
 
+// GetIPToHost returns the primary POD_IP, in canonical form, for the V1
+// frontend. The host initiator cannot reach pod-local Multus storage networks.
+// Standalone callers without POD_IP fall back to the host default IP discovery.
 func GetIPToHost() (string, error) {
+	return getIPToHost(os.Getenv(lhnet.EnvPodIP), getHostDefaultIP)
+}
+
+func getIPToHost(podIP string, getDefaultIP func() (string, error)) (string, error) {
+	if podIP != "" {
+		ip := net.ParseIP(podIP)
+		if !lhnet.IsUsableIPForFamily(ip, lhnet.IPFamilyUnspecified) {
+			return "", fmt.Errorf("invalid POD_IP %q", podIP)
+		}
+		// The portal is matched as text against iscsiadm output, so return the
+		// same canonical spelling as the session portal reuse path.
+		return ip.String(), nil
+	}
+
+	logrus.Warnf("%s is not set; falling back to the host default IP discovery, which may not match the pod primary IP family", lhnet.EnvPodIP)
+	return getDefaultIP()
+}
+
+func getHostDefaultIP() (string, error) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return "", err

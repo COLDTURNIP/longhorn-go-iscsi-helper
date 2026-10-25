@@ -213,6 +213,69 @@ func IsTargetLoggedIn(ip, target string, nsexec *lhns.Executor) bool {
 	return found
 }
 
+// GetTargetSessionIP returns the current portal IP (without brackets or port)
+// for target from iscsiadm's detailed session listing. No matching session,
+// including iscsiadm exit code 21, returns an empty IP and nil error. Repeated
+// sessions at the same portal are accepted; distinct portals are an error rather
+// than an arbitrary choice. Non-default ports are rejected because callers use
+// bare IPs with the default iSCSI port. All other command/parse errors propagate.
+func GetTargetSessionIP(target string, nsexec *lhns.Executor) (string, error) {
+	opts := []string{"-m", "session", "-P", "3"}
+	output, err := nsexec.Execute(nil, iscsiBinary, opts, lhtypes.ExecuteDefaultTimeout)
+	return getTargetSessionIP(output, target, err)
+}
+
+func getTargetSessionIP(output, target string, sessionErr error) (string, error) {
+	if sessionErr != nil {
+		var exitErr interface{ ExitCode() int }
+		if errors.As(sessionErr, &exitErr) && exitErr.ExitCode() == 21 {
+			return "", nil
+		}
+		return "", errors.Wrap(sessionErr, "failed to list iSCSI sessions")
+	}
+
+	ip := ""
+	inTarget, hasPortal := false, false
+	scanner := bufio.NewScanner(strings.NewReader(output))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if value, ok := strings.CutPrefix(line, "Target: "); ok {
+			if inTarget && !hasPortal {
+				return "", fmt.Errorf("no current portal in session for target %s", target)
+			}
+			fields := strings.Fields(value)
+			inTarget = len(fields) > 0 && fields[0] == target
+			hasPortal = false
+			continue
+		}
+		value, ok := strings.CutPrefix(line, "Current Portal: ")
+		if !inTarget || !ok {
+			continue
+		}
+
+		portal, _, _ := strings.Cut(value, ",")
+		host, port, err := net.SplitHostPort(portal)
+		if err != nil || net.ParseIP(host) == nil {
+			return "", fmt.Errorf("invalid current portal %q for target %s", value, target)
+		}
+		if port != "3260" {
+			return "", fmt.Errorf("unsupported current portal port %q for target %s", port, target)
+		}
+		currentIP := net.ParseIP(host).String()
+		if ip != "" && ip != currentIP {
+			return "", fmt.Errorf("multiple distinct current portals for target %s", target)
+		}
+		ip, hasPortal = currentIP, true
+	}
+	if err := scanner.Err(); err != nil {
+		return "", errors.Wrap(err, "failed to parse iSCSI sessions")
+	}
+	if inTarget && !hasPortal {
+		return "", fmt.Errorf("no current portal in session for target %s", target)
+	}
+	return ip, nil
+}
+
 func manualScanSession(ip, target string, nsexec *lhns.Executor) error {
 	opts := []string{
 		"-m", "node",
